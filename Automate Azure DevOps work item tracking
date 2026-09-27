@@ -1,0 +1,66 @@
+Import-Module ImportExcel
+
+$org = "XYZImplementation" #Organisation Name
+$project = "XYZ DevOps" #Devops Project
+$pat = "YOUR_NEW_PAT" #Personal Access token from Azure 
+$workItemId = XYZ #WorkItem Id
+$outFile = "C:\Users\Desktop\AdoReport\WI_XYZ.xlsx" #Path for file generation
+
+$auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+$headers = @{ Authorization = "Basic $auth" }
+
+$projectEsc = [uri]::EscapeDataString($project)
+$wiUrl = [string]::Format(
+  'https://dev.azure.com/{0}/{1}/_apis/wit/workitems/{2}?$expand=relations&api-version=7.1',
+  $org, $projectEsc, $workItemId
+)
+
+$wi = Invoke-RestMethod -Method Get -Uri $wiUrl -Headers $headers
+
+$wiSheet = @([pscustomobject]@{
+  WorkItemId   = $wi.id
+  Title        = $wi.fields.'System.Title'
+  State        = $wi.fields.'System.State'
+  WorkItemType = $wi.fields.'System.WorkItemType'
+})
+
+$changesetSheet = @()
+$objectSheet = @()
+$seen = @{}
+
+foreach ($rel in @($wi.relations)) {
+  if ($rel.rel -eq "ArtifactLink" -and $rel.url -like "vstfs:///VersionControl/Changeset/*") {
+    $csId = ($rel.url -split "/")[-1]
+
+    $changesetSheet += [pscustomobject]@{
+      WorkItemId  = $wi.id
+      ChangesetId = $csId
+      LinkName    = $rel.attributes.name
+      ArtifactUrl = $rel.url
+    }
+
+    if (-not $seen.ContainsKey($csId)) {
+      $seen[$csId] = $true
+      $changesUrl = "https://dev.azure.com/$org/_apis/tfvc/changesets/$csId/changes?api-version=7.1"
+      $resp = Invoke-RestMethod -Method Get -Uri $changesUrl -Headers $headers
+
+      foreach ($c in @($resp.value)) {
+        $path = $c.item.path
+        $objectSheet += [pscustomobject]@{
+          WorkItemId  = $wi.id
+          ChangesetId = $csId
+          ObjectName  = [System.IO.Path]::GetFileName($path)
+          ObjectPath  = $path
+          ChangeType  = $c.changeType
+        }
+      }
+    }
+  }
+}
+
+if (Test-Path $outFile) { Remove-Item $outFile -Force }
+$wiSheet        | Export-Excel -Path $outFile -WorksheetName "WorkItem"   -AutoSize
+$changesetSheet | Export-Excel -Path $outFile -WorksheetName "Changesets" -AutoSize
+$objectSheet    | Export-Excel -Path $outFile -WorksheetName "Objects"    -AutoSize
+
+Write-Host "Created: $outFile"
